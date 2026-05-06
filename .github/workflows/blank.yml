@@ -31,100 +31,66 @@ jobs:
             x11-xserver-utils
           echo "✔ XFCE installed"
 
-      - name: Install TigerVNC
+      - name: Install TigerVNC + noVNC
         run: |
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
             tigervnc-standalone-server \
-            tigervnc-common
+            tigervnc-common \
+            novnc \
+            websockify
+          echo "✔ TigerVNC + noVNC installed"
 
-          # Verify install
-          VNC_PASS_BIN=$(which vncpasswd || find /usr -name vncpasswd 2>/dev/null | head -1)
-          VNC_SERVER_BIN=$(which vncserver || find /usr -name vncserver 2>/dev/null | head -1)
-
-          if [ -z "$VNC_PASS_BIN" ]; then
-            echo "TigerVNC vncpasswd not found, falling back to tightvncserver..."
-            sudo apt-get install -y tightvncserver
-            VNC_PASS_BIN=$(which vncpasswd)
-          fi
-
-          echo "vncpasswd : $VNC_PASS_BIN"
-          echo "vncserver : $VNC_SERVER_BIN"
-          echo "✔ VNC server ready"
-
-      - name: Install noVNC
-        run: |
-          sudo apt-get install -y novnc websockify
-          echo "✔ noVNC installed"
-
-      - name: Configure and start VNC server
+      - name: Configure VNC server
         env:
           VNC_PASSWORD: ${{ github.event.inputs.vnc_password }}
         run: |
           mkdir -p ~/.vnc
 
-          # ── Set VNC password ───────────────────────────────────────────
-          # Try vncpasswd binary first, fall back to Python DES encoding
-          VNC_PASS_BIN=$(which vncpasswd || find /usr -name vncpasswd 2>/dev/null | head -1 || echo "")
+          # Set VNC password
+          VNC_PASS_BIN=$(which vncpasswd || find /usr -name vncpasswd 2>/dev/null | head -1)
+          echo "$VNC_PASSWORD" | "$VNC_PASS_BIN" -f > ~/.vnc/passwd
+          chmod 600 ~/.vnc/passwd
+          echo "✔ VNC password set"
 
-          if [ -n "$VNC_PASS_BIN" ]; then
-            echo "$VNC_PASSWORD" | "$VNC_PASS_BIN" -f > ~/.vnc/passwd
-            echo "✔ Password set via vncpasswd"
-          else
-            echo "Using Python to write VNC password file..."
-            python3 - "$VNC_PASSWORD" << 'PYEOF'
-          import sys, struct
-          pwd = sys.argv[1][:8].ljust(8, '\x00')
-          key = [23,82,107,6,35,78,88,7]
-          def reverse_bits(b):
-              result = 0
-              for _ in range(8):
-                  result = (result << 1) | (b & 1)
-                  b >>= 1
-              return result
-          import os
-          out = bytearray()
-          for i in range(8):
-              k = reverse_bits(key[i])
-              p = reverse_bits(ord(pwd[i]))
-              # Simple XOR-based stub — use OpenSSL for real DES
-              out.append(p ^ k)
-          # Use openssl for proper DES encryption
-          PYEOF
-            # Use openssl as the reliable fallback
-            printf '%s' "$VNC_PASSWORD" | \
-              openssl enc -des-ecb -nosalt -nopad \
-              -K "$(echo -n 'password' | od -A n -t x1 | tr -d ' \n')" \
-              -in /dev/stdin -out ~/.vnc/passwd 2>/dev/null || \
-            # Last resort: create a plain password file tightvnc can read
-            echo "$VNC_PASSWORD" > ~/.vnc/plainpasswd
-            echo "✔ Password set via openssl"
-          fi
-          chmod 600 ~/.vnc/passwd 2>/dev/null || chmod 600 ~/.vnc/plainpasswd 2>/dev/null
-
-          # ── XFCE startup script ────────────────────────────────────────
+          # XFCE startup — disable light-locker & power manager to avoid container errors
           cat > ~/.vnc/xstartup << 'EOF'
           #!/bin/bash
           unset SESSION_MANAGER
           unset DBUS_SESSION_BUS_ADDRESS
           export XDG_SESSION_TYPE=x11
+
+          # Suppress common container warnings
+          export NO_AT_BRIDGE=1
+          export LIBDBUSMENU_GREETER_DIR=/dev/null
+
+          # Disable screen locking and power management (unsupported in container)
+          xfconf-query -c xfce4-screensaver -p /saver/enabled -s false 2>/dev/null || true
+          xfconf-query -c xfce4-power-manager -p /xfce4-power-manager/presentation-mode -s true 2>/dev/null || true
+
           exec startxfce4
           EOF
           chmod +x ~/.vnc/xstartup
+          echo "✔ xstartup configured"
 
-          # ── Start VNC on display :1 (port 5901) ────────────────────────
+      - name: Start VNC server
+        run: |
           VNC_SERVER_BIN=$(which vncserver || find /usr -name vncserver 2>/dev/null | head -1)
+
           "$VNC_SERVER_BIN" :1 \
             -geometry 1280x720 \
             -depth 24 \
             -localhost yes \
             -SecurityTypes VncAuth
-          sleep 4
+          sleep 5
 
-          if "$VNC_SERVER_BIN" -list 2>/dev/null | grep -q ":1"; then
-            echo "✔ VNC server running on port 5901"
+          # ── Verify by checking port 5901 directly ──────────────────────
+          # (vncserver -list is unreliable in CI — port check is more robust)
+          if ss -tlnp 2>/dev/null | grep -q ':5901' || \
+             netstat -tlnp 2>/dev/null | grep -q ':5901'; then
+            echo "✔ VNC server confirmed running on port 5901"
           else
-            echo "✘ VNC failed to start, checking logs..."
-            cat ~/.vnc/*.log 2>/dev/null | tail -30 || true
+            echo "✘ Port 5901 not listening. VNC logs:"
+            cat ~/.vnc/*.log 2>/dev/null | tail -20 || true
             exit 1
           fi
 
@@ -135,7 +101,14 @@ jobs:
             6080 \
             localhost:5901
           sleep 2
-          echo "✔ noVNC running → http://localhost:6080/vnc.html"
+
+          # Verify noVNC
+          if ss -tlnp | grep -q ':6080'; then
+            echo "✔ noVNC running on port 6080"
+          else
+            echo "✘ noVNC failed to start"
+            exit 1
+          fi
 
       - name: Install and start Cloudflare tunnel
         env:
@@ -158,13 +131,13 @@ jobs:
           echo "╔══════════════════════════════════════════════════════════════╗"
           echo "║            XFCE Desktop — Connection Details                 ║"
           echo "╠══════════════════════════════════════════════════════════════╣"
-          echo "║  BROWSER (Android Chrome — easiest):                         ║"
+          echo "║  BROWSER (Android Chrome — no app needed):                   ║"
           printf "║    https://%-50s║\n" "$CF_NOVNC/vnc.html"
           echo "╠══════════════════════════════════════════════════════════════╣"
           echo "║  VNC APP (Termux + RealVNC):                                  ║"
           printf "║    cloudflared access tcp --hostname %-24s║\n" "$CF_VNC"
           echo "║    --url localhost:5901                                       ║"
-          echo "║    Then connect VNC app to localhost:5901                     ║"
+          echo "║    Then open RealVNC → localhost:5901                         ║"
           echo "╠══════════════════════════════════════════════════════════════╣"
           echo "║  Password: (what you entered in the workflow input)           ║"
           echo "╚══════════════════════════════════════════════════════════════╝"
@@ -176,6 +149,4 @@ jobs:
 
       - name: Cleanup
         if: always()
-        run: |
-          vncserver -kill :1 2>/dev/null || true
-          echo "✔ Session ended"
+        run: vncserver -kill :1 2>/dev/null || true
