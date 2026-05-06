@@ -1,4 +1,4 @@
-name: SSH Tunnel via ngrok (Android-friendly)
+name: SSH Tunnel via Cloudflare
 
 on:
   workflow_dispatch:
@@ -24,72 +24,66 @@ jobs:
         env:
           SESSION_PASSWORD: ${{ github.event.inputs.ssh_password }}
         run: |
-          # Set password for the runner user
           echo "runner:${SESSION_PASSWORD}" | sudo chpasswd
 
-          # Enable password authentication in sshd
-          sudo sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/'           /etc/ssh/sshd_config
           sudo sed -i 's/^#\?ChallengeResponseAuthentication.*/ChallengeResponseAuthentication yes/' /etc/ssh/sshd_config
-          sudo sed -i 's/^#\?PermitEmptyPasswords.*/PermitEmptyPasswords no/' /etc/ssh/sshd_config
+          sudo sed -i 's/^#\?PermitEmptyPasswords.*/PermitEmptyPasswords no/'                /etc/ssh/sshd_config
+          sudo sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/'               /etc/ssh/sshd_config
 
-          # Also allow optional public-key auth (for Termux users)
-          sudo sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' /etc/ssh/sshd_config
-
-          # Inject public key if secret is set (Termux users)
-          if [ -n "${{ secrets.SSH_PUBLIC_KEY }}" ]; then
-            mkdir -p ~/.ssh
-            echo "${{ secrets.SSH_PUBLIC_KEY }}" >> ~/.ssh/authorized_keys
-            chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys
-            echo "✔ Public key injected (Termux key-based login enabled)"
-          fi
-
-      - name: Start SSH daemon
-        run: |
           sudo systemctl restart ssh
-          sudo systemctl status ssh --no-pager
+          echo "✔ SSH daemon ready with password auth"
 
-      - name: Install ngrok & open tunnel
-        env:
-          NGROK_TOKEN: ${{ secrets.NGROK_TOKEN }}
+      - name: Install cloudflared
         run: |
-          # ── Install ngrok ──────────────────────────────────────────────
-          curl -s https://ngrok-agent.s3.amazonaws.com/ngrok.asc \
-            | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
-          echo "deb https://ngrok-agent.s3.amazonaws.com buster main" \
-            | sudo tee /etc/apt/sources.list.d/ngrok.list
-          sudo apt-get update -qq && sudo apt-get install -qq ngrok
+          curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg \
+            | sudo tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null
+          echo "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] \
+            https://pkg.cloudflare.com/cloudflared any main" \
+            | sudo tee /etc/apt/sources.list.d/cloudflared.list
+          sudo apt-get update -qq && sudo apt-get install -qq cloudflared
+          cloudflared --version
 
-          # ── Authenticate & start tunnel ────────────────────────────────
-          ngrok config add-authtoken "$NGROK_TOKEN"
-          ngrok tcp 22 --log=stdout &
+      - name: Start Cloudflare Tunnel
+        env:
+          CLOUDFLARE_TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
+        run: |
+          # Run the tunnel in background using the token from CF dashboard
+          cloudflared tunnel --no-autoupdate run --token "$CLOUDFLARE_TUNNEL_TOKEN" &
           sleep 5
+          echo "✔ Cloudflare Tunnel started"
 
-          # ── Print connection info ──────────────────────────────────────
-          echo ""
-          echo "╔══════════════════════════════════════════════╗"
-          echo "║         Android SSH Connection Info          ║"
-          echo "╚══════════════════════════════════════════════╝"
-          curl -s http://localhost:4040/api/tunnels | python3 -c "
-          import sys, json
-          tunnels = json.load(sys.stdin).get('tunnels', [])
-          if not tunnels:
-              print('ERROR: No tunnels found – check NGROK_TOKEN secret.')
-              sys.exit(1)
-          url = tunnels[0]['public_url']
-          host, port = url.replace('tcp://', '').split(':')
-          print(f'  Host     : {host}')
-          print(f'  Port     : {port}')
-          print(f'  Username : runner')
-          print(f'  Password : (the password you entered above)')
-          print()
-          print(f'  Full command (Termux):')
-          print(f'  ssh runner@{host} -p {port}')
-          "
-          echo "══════════════════════════════════════════════"
-          echo ""
+          # ── Print connection instructions ──────────────────────────────
+          CF_HOSTNAME="${{ secrets.CF_SSH_HOSTNAME }}"   # e.g. ssh.yourdomain.com
 
-          # ── Keep alive ────────────────────────────────────────────────
+          echo ""
+          echo "╔══════════════════════════════════════════════════════════╗"
+          echo "║          Cloudflare SSH — Connection Details             ║"
+          echo "╠══════════════════════════════════════════════════════════╣"
+          printf "║  Hostname : %-44s║\n" "$CF_HOSTNAME"
+          echo "║  Username : runner                                       ║"
+          echo "║  Password : (what you typed above)                       ║"
+          echo "╠══════════════════════════════════════════════════════════╣"
+          echo "║  Termux — first time setup:                              ║"
+          echo "║    pkg update && pkg install cloudflared openssh         ║"
+          echo "╠══════════════════════════════════════════════════════════╣"
+          echo "║  Termux — connect:                                       ║"
+          printf "║    ssh -o ProxyCommand=\"cloudflared access tcp           ║\n"
+          printf "║    --hostname %s\"                   ║\n" "$CF_HOSTNAME"
+          printf "║    runner@%s                          ║\n" "$CF_HOSTNAME"
+          echo "╠══════════════════════════════════════════════════════════╣"
+          echo "║  ~/.ssh/config shortcut (paste in Termux):               ║"
+          echo "║    Host cf-runner                                        ║"
+          printf "║      HostName %-44s║\n"  "$CF_HOSTNAME"
+          echo "║      User runner                                         ║"
+          printf "║      ProxyCommand cloudflared access tcp               ║\n"
+          printf "║               --hostname %s        ║\n" "$CF_HOSTNAME"
+          echo "║  Then just: ssh cf-runner                                ║"
+          echo "╚══════════════════════════════════════════════════════════╝"
+
+          # ── Keep alive ─────────────────────────────────────────────────
           DURATION=${{ github.event.inputs.duration }}
           if [ "$DURATION" -gt 60 ]; then DURATION=60; fi
-          echo "Tunnel open for ${DURATION} minute(s)…"
+          echo ""
+          echo "Tunnel open for ${DURATION} minute(s). Sleeping..."
           sleep $(( DURATION * 60 ))
