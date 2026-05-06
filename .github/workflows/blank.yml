@@ -1,24 +1,95 @@
-- name: Open SSH tunnel via ngrok
-  env:
-    NGROK_TOKEN: ${{ secrets.NGROK_TOKEN }}
-  run: |
-    # Install ngrok
-    curl -s https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
-    echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/sources.list.d/ngrok.list
-    sudo apt-get update -qq && sudo apt-get install -qq ngrok
+name: SSH Tunnel via ngrok (Android-friendly)
 
-    # Auth and start tunnel
-    ngrok config add-authtoken "$NGROK_TOKEN"
-    ngrok tcp 22 &
+on:
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: "Tunnel duration in minutes (max 60)"
+        required: false
+        default: "30"
+        type: number
+      ssh_password:
+        description: "Temporary SSH password for this session"
+        required: true
+        type: string
 
-    # Print the connection string
-    sleep 3
-    curl -s http://localhost:4040/api/tunnels | python3 -c "
-    import sys,json
-    t = json.load(sys.stdin)['tunnels'][0]['public_url']
-    host, port = t.replace('tcp://','').split(':')
-    print(f'ssh runner@{host} -p {port}')
-    "
+jobs:
+  ssh-tunnel:
+    name: Open SSH Tunnel
+    runs-on: ubuntu-latest
+    timeout-minutes: 65
 
-    # Keep the job alive for 30 mins so you can work
-    sleep 1800
+    steps:
+      - name: Configure SSH password authentication
+        env:
+          SESSION_PASSWORD: ${{ github.event.inputs.ssh_password }}
+        run: |
+          # Set password for the runner user
+          echo "runner:${SESSION_PASSWORD}" | sudo chpasswd
+
+          # Enable password authentication in sshd
+          sudo sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/^#\?ChallengeResponseAuthentication.*/ChallengeResponseAuthentication yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/^#\?PermitEmptyPasswords.*/PermitEmptyPasswords no/' /etc/ssh/sshd_config
+
+          # Also allow optional public-key auth (for Termux users)
+          sudo sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' /etc/ssh/sshd_config
+
+          # Inject public key if secret is set (Termux users)
+          if [ -n "${{ secrets.SSH_PUBLIC_KEY }}" ]; then
+            mkdir -p ~/.ssh
+            echo "${{ secrets.SSH_PUBLIC_KEY }}" >> ~/.ssh/authorized_keys
+            chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys
+            echo "✔ Public key injected (Termux key-based login enabled)"
+          fi
+
+      - name: Start SSH daemon
+        run: |
+          sudo systemctl restart ssh
+          sudo systemctl status ssh --no-pager
+
+      - name: Install ngrok & open tunnel
+        env:
+          NGROK_TOKEN: ${{ secrets.NGROK_TOKEN }}
+        run: |
+          # ── Install ngrok ──────────────────────────────────────────────
+          curl -s https://ngrok-agent.s3.amazonaws.com/ngrok.asc \
+            | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
+          echo "deb https://ngrok-agent.s3.amazonaws.com buster main" \
+            | sudo tee /etc/apt/sources.list.d/ngrok.list
+          sudo apt-get update -qq && sudo apt-get install -qq ngrok
+
+          # ── Authenticate & start tunnel ────────────────────────────────
+          ngrok config add-authtoken "$NGROK_TOKEN"
+          ngrok tcp 22 --log=stdout &
+          sleep 5
+
+          # ── Print connection info ──────────────────────────────────────
+          echo ""
+          echo "╔══════════════════════════════════════════════╗"
+          echo "║         Android SSH Connection Info          ║"
+          echo "╚══════════════════════════════════════════════╝"
+          curl -s http://localhost:4040/api/tunnels | python3 -c "
+          import sys, json
+          tunnels = json.load(sys.stdin).get('tunnels', [])
+          if not tunnels:
+              print('ERROR: No tunnels found – check NGROK_TOKEN secret.')
+              sys.exit(1)
+          url = tunnels[0]['public_url']
+          host, port = url.replace('tcp://', '').split(':')
+          print(f'  Host     : {host}')
+          print(f'  Port     : {port}')
+          print(f'  Username : runner')
+          print(f'  Password : (the password you entered above)')
+          print()
+          print(f'  Full command (Termux):')
+          print(f'  ssh runner@{host} -p {port}')
+          "
+          echo "══════════════════════════════════════════════"
+          echo ""
+
+          # ── Keep alive ────────────────────────────────────────────────
+          DURATION=${{ github.event.inputs.duration }}
+          if [ "$DURATION" -gt 60 ]; then DURATION=60; fi
+          echo "Tunnel open for ${DURATION} minute(s)…"
+          sleep $(( DURATION * 60 ))
